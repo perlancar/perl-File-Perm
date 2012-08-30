@@ -1,0 +1,454 @@
+
+
+
+
+
+
+
+#  check_file_add_section
+#  check_file_remove_section
+#  check_file_patch
+#  get_section_lines_from_file
+#  section_exists
+#  check_file_regex
+
+sub cfmeta_fix { {prio=>0} }
+sub cf_fix {
+    my %args = @_;
+}
+
+sub cfmeta_exists { {prio=>1} }
+sub cf_exists {
+    my %args = @_;
+    my $path  = $args{path};
+    my $value = $args{value};
+    if ($value) {
+    }
+}
+
+sub cfmeta_owner { {prio=>1} }
+sub cf_owner {
+}
+
+sub cfprio_owner  { 1 }
+
+
+sub _add_section {
+  my %args = @_;
+  my $section;
+  my $re;
+  my $status = 0; # 0=ok, 1=error, 2=error and fixed
+
+  $log->info("Performing check_file_add_section: file=$args{path}, id=$args{id}");
+
+  my $content = slurp_q($args{path});
+  if (!defined($content)) { $log->fatal("Can't read file `$args{path}': $!. Aborting."); exit 1 }
+
+  if ($args{comment_style} eq 'cpp') {
+    $re = qr!^// BEGIN SPANEL SECTION ver=(\d+(?:\.\d+)+) id=\Q$args{id}\E\n(.*?)^// END SPANEL SECTION\n!ims;
+  } elsif ($args{comment_style} eq 'shell') {
+    $re = qr!^# BEGIN SPANEL SECTION ver=(\d+(?:\.\d+)+) id=\Q$args{id}\E\n(.*?)^# END SPANEL SECTION\n!ims;
+  }
+  $log->debug("re=$re");
+
+  my $new_target = join "", (map {"$_\n"} @{ $args{lines} });
+  my $new_target_with_delimiter;
+  if ($args{comment_style} eq 'cpp') {
+    $new_target_with_delimiter = "// BEGIN SPANEL SECTION ver=$Spanel::VERSION id=$args{id}\n" . $new_target . "// END SPANEL SECTION\n";
+  } elsif ($args{comment_style} eq 'shell') {
+    $new_target_with_delimiter = "# BEGIN SPANEL SECTION ver=$Spanel::VERSION id=$args{id}\n" . $new_target . "# END SPANEL SECTION\n";
+  }
+
+  if ($args{good_pattern} && $content =~ /$args{good_pattern}/) {
+    $log->debug("good_pattern found ($args{good_pattern})");
+    my $ct2 = $content;
+    if ($ct2 =~ s/$re//im && $ct2 =~ /$args{good_pattern}/) {
+      $log->info("$args{path}: Good pattern found, removing section `$args{id}'");
+      $content = $ct2;
+      $status = 2;
+    } else {
+      goto SKIP;
+    }
+  } elsif ($content =~ /$re/) {
+    my ($version, $target) = ($1, $2);
+    $log->debug("Existing section found (version=$version)");
+    my $needfix = 0;
+    my $needreplace = 0;
+    if ($version ne $Spanel::VERSION) {
+      $log->info("$args{path}: Section `$args{id}' was written by a different spanel version ($version, now=$Spanel::VERSION)");
+      #$needfix++;
+    }
+    if ($target ne $new_target) {
+      $log->warn("$args{path}: Section `$args{id}' is different: old=\"".c_escape($target)."\", new=\"".c_escape($new_target)."\"");
+      $needfix++;
+    }
+    if ($args{replace_pattern} && $content =~ /$args{replace_pattern}/) {
+      $needreplace++;
+      $needfix++;
+    }
+    if ($needfix) {
+      $status = 1;
+      if ($Fix) {
+        my $oldcontent = $content;
+        if ($needreplace) {
+          my $content2 = $content;
+          $content2 =~ s/$re//im;
+          if ($content2 =~ /$args{replace_pattern}/) {
+            $content2 =~ s/$args{replace_pattern}/$new_target_with_delimiter/im;
+            $content = $content2;
+          } else {
+            $content =~ s/$re/$new_target_with_delimiter/im;
+          }
+        } else {
+          $content =~ s/$re/$new_target_with_delimiter/im;
+        }
+        if ($content eq $oldcontent) {
+          $status = 0;
+          goto SKIP;
+        } else {
+          $log->info("$args{path}: Updating section `$args{id}'...");
+          $status = 2;
+        }
+      }
+    }
+  } else {
+    $log->warn("$args{path}: Section `$args{id}' has not been added");
+    $status = 1;
+    if ($Fix) {
+      $log->info("$args{path}: Adding section `$args{id}'...");
+      if ($args{replace_pattern} && $content =~ /$args{replace_pattern}/) {
+        $log->debug("replace_pattern found ($args{replace_pattern})");
+        $content =~ s/$args{replace_pattern}/$new_target_with_delimiter/;
+      } else {
+        $content .= ($content =~ /\n\z/ ? "" : "\n") . $new_target_with_delimiter;
+      }
+      $status = 2;
+    }
+  }
+
+ # XXX support adding a section after a certain position, e.g. after
+ # "[mysqld]" (and add if not exists)
+
+  write_file_with_backup($args{path}, $content);
+ SKIP:
+  return $status;
+}
+
+sub check_file_patch {
+  my %args = @_;
+  my $status = 0; # 0=already patched, 1=needs patching, 2=needs patching and patched. jika patch gagal, croaks.
+
+  $log->info("Performing check_file_patch: file=$args{path}, patch=$args{patch_path}");
+
+  my $cmd;
+  my $res;
+
+  $cmd = "patch --dry-run -N ".shell_quote($args{path})." < ".shell_quote($args{patch_path})." 2>&1";
+  $res = `$cmd`;
+  if ($? == 0) {
+    $log->debug("Can be patched, patching ...");
+    $status = 1;
+    if ($Fix) {
+      $cmd = "patch -N ".shell_quote($args{path})." < ".shell_quote($args{patch_path})." 2>&1";
+      $res = `$cmd`;
+      if ($?) {
+        $log->fatal("Patching `$args{path}' with `$args{patch_path}' failed, please check this manually, aborting");
+        exit 1;
+      }
+      $status = 2;
+    }
+  } elsif ($res =~ / FAILED /) {
+    $log->fatal("Patching `$args{path}' with `$args{patch_path}' failed, please check this manually, aborting");
+    exit 1;
+  } elsif ($res =~ / ignored /) {
+    $log->debug("Already patched, ignoring this patch");
+    $status = 0;
+  } else {
+    $log->debug("Bug! \$?=$?, res=$res");
+  }
+
+  return $status;
+}
+
+sub check_file_remove_section {
+  my %args = @_;
+  my $section;
+  my $re;
+  my $status = 0; # 0=ok, 1=error, 2=error and fixed
+
+  $log->info("Performing check_file_remove_section: file=$args{path}, id=$args{id}");
+
+  my $content = slurp_q($args{path});
+  if (!defined($content)) { $log->fatal("Can't read file `$args{path}': $!. Aborting."); exit 1 }
+
+  my $comment_style = $args{comment_style} || 'shell';
+  if ($comment_style eq 'cpp') {
+    $re = qr!^// BEGIN SPANEL SECTION ver=(\d+(?:\.\d+)+) id=\Q$args{id}\E\n(.*?)^// END SPANEL SECTION\n!ims;
+  } elsif ($comment_style eq 'shell') {
+    $re = qr!^# BEGIN SPANEL SECTION ver=(\d+(?:\.\d+)+) id=\Q$args{id}\E\n(.*?)^# END SPANEL SECTION\n!ims;
+  }
+  $log->debug("re=$re");
+
+  if ($content =~ /$re/) {
+    $log->warn("$args{path}: Section `$args{id}' found, it should be removed");
+    $status = 1;
+    if ($Fix) {
+      $log->info("$args{path}: Removing section `$args{id}'...");
+      my $repl = $args{replacement_lines} ? join("", map {"$_\n"} @{ $args{replacement_lines} }) : "";
+      $content =~ s/$re/$repl/img;
+      write_file_with_backup($args{path}, $content);
+      $status = 2;
+    }
+  }
+  $status;
+}
+
+sub section_exists {
+  my %args = @_;
+  my $section;
+  my $re;
+
+  $log->info("Performing check_file_section_exists: file=$args{path}, id=$args{id}");
+
+  my $content = slurp_q($args{path});
+  if (!defined($content)) { $log->info("Can't read file `$args{path}': $!"); return 0 }
+
+  my $comment_style = $args{comment_style} || 'shell';
+  if ($comment_style eq 'cpp') {
+    $re = qr!^// BEGIN SPANEL SECTION ver=(\d+(?:\.\d+)+) id=\Q$args{id}\E\n(.*?)^// END SPANEL SECTION\n!ims;
+  } elsif ($comment_style eq 'shell') {
+    $re = qr!^# BEGIN SPANEL SECTION ver=(\d+(?:\.\d+)+) id=\Q$args{id}\E\n(.*?)^# END SPANEL SECTION\n!ims;
+  }
+
+  $content =~ $re;
+}
+
+sub get_section_lines_from_file {
+  my $re;
+  my %args = @_;
+
+  $log->debug("Performing get_section_lines_from_file: file=$args{path}, id=$args{id}");
+
+  my $content = slurp_q($args{path});
+  if (!defined($content)) { $log->info("Can't read file `$args{path}': $!"); return }
+
+  if ($args{comment_style} eq 'cpp') {
+    $re = qr!^// BEGIN SPANEL SECTION ver=(\d+(?:\.\d+)+) id=\Q$args{id}\E\n(.*?)^// END SPANEL SECTION\n!ims;
+  } elsif ($args{comment_style} eq 'shell') {
+    $re = qr!^# BEGIN SPANEL SECTION ver=(\d+(?:\.\d+)+) id=\Q$args{id}\E\n(.*?)^# END SPANEL SECTION\n!ims;
+  }
+
+  if ($content =~ $re) {
+    my ($ver, $body) = ($1, $2);
+    return split /\015?\012/, $body;
+  } else {
+    return;
+  }
+}
+
+# returns 0 if doesn't match. returns 1 if matches, or 2 if matches and substituted.
+
+sub check_file_regex {
+  my %args = @_;
+  my $section;
+  my $re;
+
+  $log->debug("Performing check_file_regex: file=$args{path}, info=".($args{info} || ""));
+
+  my $content = slurp_q($args{path});
+  if (!defined($content)) { $log->fatal("Can't read file `$args{path}': $!. Aborting."); exit 1 };
+
+  if ($content !~ /$args{regex}/) {
+    if ($args{warn_if_not_match}) {
+        $log->warn("File `$args{path}': ".($args{warn_if_not_match} || "")." (doesn't match regex $args{regex})");
+    } else {
+        $log->info("File `$args{path}': doesn't match regex $args{regex}");
+    }
+    if ($Fix && $args{fix_if_not_match}) {
+      return $args{fix_if_not_match}->();
+    }
+  } else {
+    if ($args{warn_if_match}) {
+        $log->warn("File `$args{path}': ".($args{warn_if_match} || "")." (matches regex $args{regex})");
+    } else {
+        $log->info("File `$args{path}': matches regex $args{regex}");
+    }
+    if ($Fix) {
+      if ($args{fix_if_match}) {
+          return $args{fix_if_match}->();
+      } elsif ($args{substitute}) {
+          my $new_content = $args{substitute}->($content);
+          if ($new_content ne $content) {
+              $log->info("Writing new content for `$args{path}'".($args{info} ? " $args{info}" : "")." ...");
+              open F, ">$args{path}"; print F $new_content; close F; # XXX jika gagal?
+              return 2;
+          }
+          return 1;
+      }
+    }
+  }
+  0;
+}
+
+# check file existence, owner/perm, and content
+# returns: 0 = ok, 1 = needs fixing, 2 = fixed
+# notes on args:
+# - fix_create_sub - if the sub returns the string "SUCCESS" then
+#     check_file won't check again whether the file has indeed been
+#     created
+# - fix_delete_sub - ditto
+
+sub check_file {
+  my %args = @_;
+  my $section;
+  my $status = 0;
+  local *F;
+
+  # -e check the existence of symlink target
+  my $exists = (-l $args{path}) || (-e _);
+
+  $log->debug("Checking file $args{path} ...");
+  if (!$exists && ((!$args{should_not_exist} && !$args{must_not_exist}) || $args{must_exist})) {
+
+    return $status if $args{need_not_exist};
+
+    $status = 1;
+    if ($args{warning_message}) {
+      # XXX sometimes we only want INFO and not WARN
+      $log->warn("File `$args{path}': $args{warning_message}");
+    } else {
+      # XXX sometimes we only want INFO and not WARN
+      $log->warn("File `$args{path}': doesn't exist");
+    }
+    if ($args{must_exist}) {
+      $log->fatal("File `$args{path}' is required to continue, please fix this first and try again. Aborting.");
+      exit 1;
+    }
+
+    if ($Fix && ($args{fix_create} || $args{fix_create_sub})) {
+      # try to create the file
+      my $res = "";
+      if ($args{fix_create_sub}) {
+        $log->debug("Invoking fix_sub...");
+        $res = $args{fix_create_sub}->();
+      } else {
+        $log->info("File `$args{path}': creating".($args{content} ? "with content '".ellipsis(c_escape($args{content}), 80)."'" : ""));
+        open F, ">$args{path}"; if ($args{content}) { print F $args{content} } close F;
+      }
+      $status = 2;
+      $exists = (-l $args{path}) || (-e _);
+      if ($res ne 'SUCCESS' && !$exists) {
+        $log->fatal("File `$args{path}': failed to create".
+          ($args{content} ? " with content='".ellipsis(c_escape($args{content}), 80)."'" : "").
+          ", aborting. Please handle this manually.");
+        exit 1;
+      }
+    }
+
+  } elsif ($exists && ($args{should_not_exist} || $args{must_not_exist})) {
+
+    $status = 1;
+    if ($args{warning_message}) {
+      # XXX sometimes we only want INFO and not WARN
+      $log->warn("File `$args{path}': $args{warning_message}");
+    } else {
+      # XXX sometimes we only want INFO and not WARN
+      $log->warn("File `$args{path}': exists when it should/must not");
+    }
+    if ($args{must_not_exist}) {
+      $log->fatal("File `$args{path}' must not exist to continue, please fix this first and try again. Aborting.");
+      exit 1;
+    }
+
+    if ($Fix && ($args{fix_delete} || $args{fix_delete_sub})) {
+      # try to create the file
+      my $res = "";
+      if ($args{fix_delete_sub}) {
+        $log->debug("Invoking fix_sub...");
+        $res = $args{fix_delete_sub}->();
+      } else {
+        $log->info("File `$args{path}': deleting");
+        unlink $args{path};
+      }
+      $status = 2;
+      $exists = (-l $args{path}) || (-e _);
+      if ($res ne 'SUCCESS' && $exists) {
+        $log->fatal("File `$args{path}': failed to delete");
+        exit 1;
+      }
+    }
+
+  }
+
+  return $status unless -e $args{path};
+
+  # XXX warn if a dir instead of file
+
+  # compare content...
+  if ($args{content}) {
+    {
+      local $/;
+      open F, $args{path}; my $curct = <F>; close F;
+      if ($args{content} ne $curct && $args{fix_content}) {
+        $log->warn("File `$args{path}': content ('".ellipsis(c_escape($curct), 80).
+          "') different from expected ('".ellipsis(c_escape($args{content}), 80)."')");
+        if ($args{must_have_same_content}) {
+          $log->fatal("File `$args{path}' content is different from expected. Cannot continue. Please fix this first and try again.");
+          exit 1;
+        }
+        if ($Fix && $args{fix_content}) {
+          $log->info("File `$args{path}': setting content to '".ellipsis(c_escape($args{content}), 80)."'");
+          open F, ">$args{path}"; print F $args{content}; close F;
+          $status = 2;
+        }
+      }
+    }
+  } elsif ($args{content_pattern}) {
+    local $/;
+    open F, $args{path}; my $ct = <F>; close F;
+    if ($ct !~ /$args{content_pattern}/) {
+      if ($args{warning_message}) {
+        $log->warn("File `$args{path}': $args{warning_message}");
+      } else {
+        $log->warn("File `$args{path}' doesn't contain required pattern $args{content_pattern}");
+      }
+      $status = 1;
+    }
+  }
+
+  # try to fix the permission
+  if ($args{owner_perm}) {
+    my $owner = $args{owner_perm}[0];
+    my $group = $args{owner_perm}[1];
+    my $perm = $args{owner_perm}[2];
+    my @stat = stat($args{path});
+    my $current_perm = $stat[2] & 07777;
+    my $current_owner = $stat[4];
+    my $current_group = $stat[5];
+    my @owner = getpwnam($owner);
+    my @group = getgrnam($group);
+    my @current_owner = getpwuid($current_owner);
+    my @current_group = getgrgid($current_group);
+    if (!@owner) { $log->error("$args{path} is supposed to be owned by `$owner', but this Unix user doesn't exist, aborting..."); exit 1 }
+    if (!@group) { $log->error("$args{path} is supposed to have group of `$group', but this Unix group doesn't exist, aborting..."); exit 1 }
+    if ($current_owner != $owner[2] || $current_group != $group[2] || $current_perm != $perm) {
+      $log->errorf("%s is supposed to have ownership/perm of (%s,%s,%04o) but it's now (%s,%s,%04o)",
+                    $args{path},
+                    $owner, $group, $perm,
+                    (@current_owner ? $current_owner[0] : $current_owner),
+                    (@current_group ? $current_group[0] : $current_group),
+                    $current_perm);
+      $status ||= 1;
+      if ($Fix && $args{fix_perm}) {
+        $log->info("Fixing ownership/permission of $args{path}...");
+        mysystem "chown '$owner':'$group' ".shell_quote($args{path});
+        mysystem "chmod ".sprintf("%04o", $perm)." ".shell_quote($args{path});
+        $status = 2;
+      }
+    }
+  }
+
+  #DEBUG "status of check_file: $status";
+  $status;
+}
+
