@@ -311,9 +311,6 @@ The idea for this module came out in 2006 as part of the Spanel hosting control
 panel project. First public release of this module is in Feb 2011.
 
 
-=head1 TODO
-
-
 =head1 SEE ALSO
 
 L<File::Fixer::Examples> for more examples.
